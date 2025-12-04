@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { BrowserRouter as Router, Routes, Route, Link, useLocation } from "react-router-dom";
 import { createThirdwebClient } from "thirdweb";
 import { defineChain } from "thirdweb/chains";
@@ -44,61 +44,135 @@ export default function App() {
   // SIMULATION STATE
   const [isSimulating, setIsSimulating] = useState(false);
 
+  // Refs to avoid stale closures inside the async loop
+  const isSimulatingRef = useRef(isSimulating);
+  const latestDataRef = useRef(data);
+  const simulatorAbortRef = useRef({ aborted: false }); // simple cancel flag
+
+  // Utility: add to logs (keeps newest on top)
+  const addLog = (msg) => setLogs(prev => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev]);
+
   // 1. Fetch Backend State (Polls every 2 seconds)
   const fetchStatus = async () => {
     try {
       const res = await axios.get(`${API_URL}/config`);
       setData(res.data);
-    } catch (e) { console.error("Backend offline"); }
+      latestDataRef.current = res.data;
+      // console.debug('fetched backend status', res.data);
+    } catch (e) {
+      console.error("Backend offline / fetchStatus failed:", e?.message || e);
+      // keep existing data; don't clear it
+    }
   };
 
   useEffect(() => {
+    // initial fetch and start polling
     fetchStatus();
     const interval = setInterval(fetchStatus, 2000);
     return () => clearInterval(interval);
   }, []);
 
-  const addLog = (msg) => setLogs(prev => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev]);
+  // Keep refs in sync with state
+  useEffect(() => { isSimulatingRef.current = isSimulating; }, [isSimulating]);
+  useEffect(() => { latestDataRef.current = data; }, [data]);
 
-  // 2. THE SIMULATION ENGINE
+  // Helper sleep
+  const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+  // Robust simulator loop (async while) — avoids setInterval closure bugs
   useEffect(() => {
-    let simInterval;
-    
-    // Only run if active AND we have agents
-    if (isSimulating && data?.agents?.length > 0) {
-        simInterval = setInterval(async () => {
-            
-            // A. Pick a Random Agent from the dynamic list
-            const randomIndex = Math.floor(Math.random() * data.agents.length);
-            const randomAgent = data.agents[randomIndex];
-            
-            // B. Scenario: 70% Legit, 30% Scam/Hack
-            const isLegit = Math.random() > 0.3;
+    // start/stop handled by isSimulatingRef and simulatorAbortRef
+    let running = false;
 
-            // C. Construct Payload
-            const payload = {
-                agentAddress: randomAgent.address,
-                to: isLegit ? "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720" : "0xScamAddress" + Math.floor(Math.random()*999),
-                amount: isLegit ? (Math.random() * 0.0001).toFixed(6) : (Math.random() * 5).toFixed(2)
-            };
+    const runSimulator = async () => {
+      if (running) return;
+      running = true;
+      simulatorAbortRef.current.aborted = false;
+      addLog(`🚦 Simulator ${isSimulatingRef.current ? "started" : "requested start"}`);
 
-            addLog(`${randomAgent.name}: Requesting ${payload.amount} ETH...`);
+      // If we don't have agents yet, do an immediate fetch and wait a bit
+      if (!latestDataRef.current || !latestDataRef.current.agents || latestDataRef.current.agents.length === 0) {
+        addLog("🔎 Waiting for agents to appear...");
+        await fetchStatus();
+        await sleep(800); // short pause to allow backend to respond
+      }
 
-            // D. Execute
-            try {
-                const res = await axios.post(`${API_URL}/rpc/execute`, payload);
-                addLog(`✅ SUCCESS: ${randomAgent.name} Approved. Hash: ${res.data.txHash.slice(0,10)}...`);
-            } catch (err) {
-                const errorMsg = err.response?.data?.error || "Unknown Error";
-                addLog(`🛑 BLOCKED: ${randomAgent.name} -> ${errorMsg}`);
-            }
+      while (isSimulatingRef.current && !simulatorAbortRef.current.aborted) {
+        const latest = latestDataRef.current;
 
-        }, 3500); // New Transaction every 3.5 seconds
+        if (!latest || !Array.isArray(latest.agents) || latest.agents.length === 0) {
+          // Nothing to simulate yet — wait and try again
+          // log once every few iterations to avoid spam
+          addLog("⏳ No agents available yet — retrying...");
+          await sleep(1500);
+          // try fetchStatus to refresh
+          await fetchStatus().catch(()=>{});
+          await sleep(1500);
+          continue;
+        }
+
+        // Pick a random agent
+        const randomIndex = Math.floor(Math.random() * latest.agents.length);
+        const randomAgent = latest.agents[randomIndex];
+
+        // 70% Legit, 30% Scam/Hack
+        const isLegit = Math.random() > 0.3;
+
+        const payload = {
+          agentAddress: randomAgent.address,
+          to: isLegit ? "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720" : ("0xScamAddress" + Math.floor(Math.random()*999)),
+          amount: isLegit ? (Math.random() * 0.0001).toFixed(6) : (Math.random() * 5).toFixed(2)
+        };
+
+        // Add UI log and console trace so you can see attempts in browser console & backend console
+        const attemptMsg = `${randomAgent.name}: Requesting ${payload.amount} ETH -> ${payload.to}`;
+        addLog(attemptMsg);
+        console.debug("[sim] POST", `${API_URL}/rpc/execute`, payload);
+
+        try {
+          const res = await axios.post(`${API_URL}/rpc/execute`, payload, { timeout: 10000 });
+          const txHash = res.data?.txHash ?? res.data?.hash ?? null;
+          addLog(`✅ SUCCESS: ${randomAgent.name} Approved. ${txHash ? `Hash: ${String(txHash).slice(0,10)}...` : "(no-hash)"}`);
+          console.info("[sim] success", res.data);
+          // Immediately refresh backend state after a successful tx so simulator sees updated spend/limits
+          await fetchStatus().catch(()=>{});
+        } catch (err) {
+          const errorMsg = err.response?.data?.error || err.message || "Unknown Error";
+          addLog(`🛑 BLOCKED: ${randomAgent.name} -> ${errorMsg}`);
+          console.warn("[sim] blocked/error", errorMsg, err);
+          // Try refreshing backend state when blocked (policy might have changed)
+          await fetchStatus().catch(()=>{});
+        }
+
+        // Respect the configured cadence
+        // If aborted while sleeping, break early
+        for (let waited = 0; waited < 3500; waited += 500) {
+          if (!isSimulatingRef.current || simulatorAbortRef.current.aborted) break;
+          await sleep(500);
+        }
+      } // end while
+
+      addLog(`🛑 Simulator stopped`);
+      running = false;
+    }; // runSimulator
+
+    if (isSimulating) {
+      runSimulator().catch(err => {
+        console.error("Simulator encountered an error:", err);
+        addLog("⚠️ Simulator error — check console");
+      });
+    } else {
+      // If simulation was turned off, signal abort
+      simulatorAbortRef.current.aborted = true;
     }
-    return () => clearInterval(simInterval);
-  }, [isSimulating, data]);
 
+    return () => {
+      simulatorAbortRef.current.aborted = true;
+      isSimulatingRef.current = false;
+    };
+  }, [isSimulating]); // only depends on the flag; uses refs for latest data
 
+  // UI
   return (
     <Router>
       <div className="flex min-h-screen bg-black text-white font-mono">
@@ -125,7 +199,19 @@ export default function App() {
                     </div>
                     
                     <button 
-                        onClick={() => setIsSimulating(!isSimulating)}
+                        onClick={() => {
+                          // Toggle state and keep ref in sync
+                          setIsSimulating(prev => {
+                            const next = !prev;
+                            isSimulatingRef.current = next;
+                            if (!next) simulatorAbortRef.current.aborted = true;
+                            return next;
+                          });
+                          // do an immediate fetch when starting so simulator has data
+                          if (!isSimulatingRef.current) {
+                            fetchStatus().catch(()=>{});
+                          }
+                        }}
                         className={`w-full py-2 rounded font-bold flex items-center justify-center gap-2 transition-all text-sm ${isSimulating ? 'bg-orange-500/20 text-orange-500 border border-orange-500 shadow-[0_0_10px_rgba(249,115,22,0.3)]' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}
                     >
                         {isSimulating ? <><Square size={12}/> STOP</> : <><Play size={12}/> START</>}

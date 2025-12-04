@@ -144,7 +144,8 @@ export default function Dashboard({ data, logs, contractAddress }) {
       <div>
         <h2 className="text-xl font-bold text-white mb-4 flex items-center gap-2"><Users className="text-blue-400"/> Agent Fleet</h2>
         
-        <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+        {/* Make sure agent cards stack vertically: one per row */}
+        <div className="flex flex-col gap-6">
             {data.agents?.map(agent => {
                 const agentLogs = logs.filter(l => l.includes(agent.name));
                 const status = agentStatuses[agent.id] || "SYNCING";
@@ -162,8 +163,8 @@ export default function Dashboard({ data, logs, contractAddress }) {
                             </div>
                         </div>
 
-                        {/* Body */}
-                        <div className="p-5 grid grid-cols-2 gap-4">
+                        {/* Body: stacked layout so feed is below controls and more visible */}
+                        <div className="p-5 grid grid-cols-1 gap-4">
                             
                             {/* Controls */}
                             <div>
@@ -195,12 +196,13 @@ export default function Dashboard({ data, logs, contractAddress }) {
                                 )}
                             </div>
 
-                            {/* Feed */}
-                            <div className="bg-black border border-gray-800 rounded p-2 h-[120px] overflow-auto custom-scrollbar">
+                            {/* Feed - placed below controls and given more height for visibility */}
+                            <div className="bg-black border border-gray-800 rounded p-3 h-[220px] overflow-auto custom-scrollbar">
+                                <div className="text-xs text-gray-400 font-bold mb-2">Transaction Feed</div>
                                 {agentLogs.length === 0 ? <div className="text-xs text-gray-700 text-center mt-8">No Activity</div> : 
-                                    agentLogs.slice(0,4).map((l,i) => (
-                                        <div key={i} className={`text-[10px] pl-1 mb-1 border-l-2 ${l.includes("BLOCKED") ? "text-red-400 border-red-500" : "text-emerald-400 border-emerald-500"}`}>
-                                            {l.split("Attempting")[0]}... {l.includes("BLOCKED") ? "BLOCKED" : "SENT"}
+                                    agentLogs.slice(0,8).map((l,i) => (
+                                        <div key={i} className={`text-[11px] pl-1 mb-2 border-l-2 ${l.includes("BLOCKED") ? "text-red-400 border-red-500" : "text-emerald-400 border-emerald-500"}`}>
+                                            {l.split("Attempting")[0]} {l.includes("BLOCKED") ? " — BLOCKED" : " — SENT"}
                                         </div>
                                     ))
                                 }
