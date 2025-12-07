@@ -2,6 +2,12 @@ import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 import { Plus, Save, Trash2, ShieldCheck } from 'lucide-react';
 
+// ---- ENV-DRIVEN API BASE (NO HARDCODED localhost) ----
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:3001";
+const api = axios.create({
+  baseURL: API_BASE_URL,
+});
+
 export default function Policies() {
   const [templates, setTemplates] = useState([]);
   const [newName, setNewName] = useState("");
@@ -9,17 +15,26 @@ export default function Policies() {
 
   // Fetch Templates from Backend (Mock DB)
   const fetchTemplates = async () => {
-    const res = await axios.get('http://localhost:3001/api/templates');
-    setTemplates(res.data);
+    try {
+      const res = await api.get('/api/templates');
+      setTemplates(res.data);
+    } catch (err) {
+      console.error("Failed to fetch templates:", err);
+    }
   };
 
   useEffect(() => { fetchTemplates(); }, []);
 
   const createTemplate = async () => {
     if (!newName || !newLimit) return;
-    await axios.post('http://localhost:3001/api/templates/add', { name: newName, value: newLimit });
-    setNewName(""); setNewLimit("");
-    fetchTemplates();
+    try {
+      await api.post('/api/templates/add', { name: newName, value: newLimit });
+      setNewName("");
+      setNewLimit("");
+      fetchTemplates();
+    } catch (err) {
+      console.error("Failed to create template:", err);
+    }
   };
 
   return (
@@ -53,7 +68,10 @@ export default function Policies() {
               className="w-full bg-black border border-gray-700 p-3 rounded text-white"
             />
           </div>
-          <button onClick={createTemplate} className="bg-blue-600 hover:bg-blue-500 p-3 rounded text-white font-bold h-[50px] px-6 flex items-center gap-2">
+          <button
+            onClick={createTemplate}
+            className="bg-blue-600 hover:bg-blue-500 p-3 rounded text-white font-bold h-[50px] px-6 flex items-center gap-2"
+          >
             <Plus size={18} /> Add
           </button>
         </div>
@@ -62,9 +80,14 @@ export default function Policies() {
       {/* TEMPLATE LIST */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         {templates.map(t => (
-          <div key={t.id} className="bg-black border border-gray-800 p-6 rounded-xl hover:border-emerald-500/50 transition-colors relative group">
+          <div
+            key={t.id}
+            className="bg-black border border-gray-800 p-6 rounded-xl hover:border-emerald-500/50 transition-colors relative group"
+          >
             <h3 className="font-bold text-lg text-white">{t.name}</h3>
-            <div className="text-3xl font-mono text-emerald-400 my-3">{t.value} <span className="text-sm text-gray-500">ETH/day</span></div>
+            <div className="text-3xl font-mono text-emerald-400 my-3">
+              {t.value} <span className="text-sm text-gray-500">ETH/day</span>
+            </div>
             <div className="text-xs text-gray-500">ID: {t.id}</div>
           </div>
         ))}
