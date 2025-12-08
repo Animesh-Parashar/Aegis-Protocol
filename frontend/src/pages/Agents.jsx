@@ -9,10 +9,7 @@ import { toUnits } from "thirdweb/utils";
 import { User, Zap, Activity, RefreshCw, PlusCircle, Trash2 } from 'lucide-react';
 import aegisAbi from '../utils/abi/aegisAbi.json';
 
-// ---- ABI ----
 const AEGIS_ABI = aegisAbi;
-
-// ---- ENV CONFIG ----
 const CLIENT_ID = import.meta.env.VITE_CLIENT_ID;
 const RPC_URL = import.meta.env.VITE_RPC_URL;
 const CHAIN_ID = Number(import.meta.env.VITE_CHAIN_ID || "84532");

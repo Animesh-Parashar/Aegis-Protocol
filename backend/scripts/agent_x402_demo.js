@@ -1,110 +1,164 @@
 // scripts/agent_x402_demo.js
-const axios = require('axios');
-const colors = require('colors');
+const colors = require("colors");
 
-// CONFIG
+// Aegis Firewall endpoint (policy + on-chain settlement for simulation)
 const FIREWALL_URL = "http://localhost:3001/api/rpc/execute";
-const AGENT_IDENTITY = "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720"; // Must match your server/dashboard setup
+
+// You will replace this with your actual agent address
+const AGENT_IDENTITY = "0x561009A39f2BC5a975251685Ae8C7F98Fac063C7";
 
 // --- MOCK x402 SERVICE ---
-// This function simulates a paid API (like OpenAI or a Data Feed)
 async function callPremiumAPI(endpoint) {
-    console.log(`\n🤖 AGENT: Requesting resource from ${endpoint}...`.cyan);
-    await new Promise(r => setTimeout(r, 800)); // Network delay
+  console.log(`\n🤖 AGENT: Requesting resource from ${endpoint}...`.cyan);
+  await new Promise((r) => setTimeout(r, 800));
 
-    // SIMULATE 402 RESPONSE
-    // The API says: "You must pay to access this."
-    if (endpoint.includes("premium")) {
-        console.log(`⚠️  API RESPONSE: 402 Payment Required`.yellow);
-        return {
-            status: 402,
-            paymentRequest: {
-                to: "0xcf942c47bc33dB4Fabc1696666058b784F9fa9ef", // The Weather API Wallet
-                amount: "0.0001", // Cost of the API call
-                currency: "ETH",
-                chainId: 84532
-            }
-        };
-    }
-    
-    // SIMULATE SCAM (For the demo)
-    if (endpoint.includes("scam")) {
-        console.log(`⚠️  API RESPONSE: 402 Payment Required`.yellow);
-        return {
-            status: 402,
-            paymentRequest: {
-                to: "0xScamAddress999999999999999999999999", // Evil Wallet
-                amount: "5.0", // Huge amount
-                currency: "ETH",
-                chainId: 84532
-            }
-        };
-    }
+  // SIMULATE 402 RESPONSE
+  if (endpoint.includes("premium")) {
+    console.log(`⚠️  API RESPONSE: 402 Payment Required`.yellow);
+    return {
+      status: 402,
+      paymentDetails: {
+        to: "0xcf942c47bc33dB4Fabc1696666058b784F9fa9ef", // Weather Service
+        amount: "100000000000000", // 0.0001 ETH in wei
+        chainId: 84532,
+        token: "0x0000000000000000000000000000000000000000", // Native ETH
+      },
+    };
+  }
+
+  if (endpoint.includes("scam")) {
+    console.log(`⚠️  API RESPONSE: 402 Payment Required`.yellow);
+    return {
+      status: 402,
+      paymentDetails: {
+        to: "0xScamAddress999999999999999999999999",
+        amount: "5000000000000000000", // 5.0 ETH in wei
+        chainId: 84532,
+        token: "0x0000000000000000000000000000000000000000",
+      },
+    };
+  }
+
+  return { status: 200, data: "Here is your free data." };
 }
 
 // --- THE AGENT BRAIN ---
 async function runAgent() {
-    console.log("==========================================".white);
-    console.log("   AI AGENT STARTED: IDLE MODE".white);
-    console.log("==========================================".white);
+  console.log("==========================================".white);
+  console.log("   AI AGENT STARTED: x402 MODE".white);
+  console.log("==========================================".white);
 
-    // SCENARIO 1: LEGIT TRANSACTION
-    console.log("\n--- TASK 1: Buy Weather Data ---".white);
-    
-    // 1. Hit the API
-    const response = await callPremiumAPI("https://api.weather.com/premium/forecast");
+  // SCENARIO 1: LEGIT TRANSACTION
+  console.log("\n--- TASK 1: Buy Weather Data ---".white);
 
-    // 2. Handle x402 (The Interception)
-    if (response.status === 402) {
-        console.log(`🔒 AGENT: Paywall detected. Asking Aegis Firewall for permission...`.blue);
-        
-        try {
-            const req = response.paymentRequest;
-            
-            // 3. Call Aegis (Instead of signing directly)
-            const aegisResponse = await axios.post(FIREWALL_URL, {
-                agentAddress: AGENT_IDENTITY,
-                to: req.to,
-                amount: req.amount
-            });
+  const response = await callPremiumAPI(
+    "https://api.weather.com/premium/forecast"
+  );
 
-            if (aegisResponse.data.success) {
-                console.log(`✅ AEGIS: Transaction Approved & Signed!`.green);
-                console.log(`🚀 Tx Hash: ${aegisResponse.data.txHash}`.gray);
-                console.log(`🔓 AGENT: Accessing Data... SUCCESS.`.cyan);
-            }
+  if (response.status === 402) {
+    console.log(
+      `🔒 AGENT: Paywall detected. Sending invoice to Aegis Firewall...`.blue
+    );
 
-        } catch (error) {
-            console.log(`🛑 AEGIS BLOCKED: ${error.response?.data?.error || error.message}`.red);
+    try {
+      const invoice = response.paymentDetails;
+
+      const aegisResponse = await fetch(FIREWALL_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          agentAddress: AGENT_IDENTITY,
+          to: invoice.to,
+          amount: invoice.amount, // wei string
+          chainId: invoice.chainId,
+          token: invoice.token,
+        }),
+      });
+
+      const data = await aegisResponse.json();
+
+      if (!aegisResponse.ok) {
+        throw new Error(data.error || "Firewall HTTP error");
+      }
+
+      if (!data.approved) {
+        throw new Error(data.reason || "Payment not approved by Aegis");
+      }
+
+      console.log(`✅ AEGIS: Payment Authorized & Settled On-Chain!`.green);
+
+      if (data.settlement && data.settlement.txHash) {
+        console.log(`🚀 Tx Hash: ${data.settlement.txHash}`.gray);
+        if (data.settlement.explorerUrl) {
+          console.log(
+            `🔗 Explorer: ${data.settlement.explorerUrl}`.gray
+          );
         }
+      }
+
+      console.log(`🔓 AGENT: Accessing Data... SUCCESS.`.cyan);
+    } catch (error) {
+      console.log(`🛑 AEGIS BLOCKED: ${error.message}`.red);
     }
+  }
 
-    await new Promise(r => setTimeout(r, 4000)); // Pause for effect
+  await new Promise((r) => setTimeout(r, 2000));
 
-    // SCENARIO 2: MALICIOUS/HALLUCINATED TRANSACTION
-    console.log("\n--- TASK 2: Download 'Free' RAM (Scam Link) ---".white);
-    
-    const badResponse = await callPremiumAPI("https://scam-site.com/download-ram");
+  // SCENARIO 2: SCAM
+  console.log("\n--- TASK 2: Download 'Free' RAM (Scam Link) ---".white);
 
-    if (badResponse.status === 402) {
-        console.log(`🔒 AGENT: Paywall detected. Asking Aegis Firewall for permission...`.blue);
-        
-        try {
-            const req = badResponse.paymentRequest;
-            
-            // Call Aegis
-            await axios.post(FIREWALL_URL, {
-                agentAddress: AGENT_IDENTITY,
-                to: req.to,
-                amount: req.amount
-            });
-            // Should not reach here
-        } catch (error) {
-            console.log(`🛡️  AEGIS INTERVENTION:`.red);
-            console.log(`❌ BLOCK REASON: ${error.response?.data?.error}`.red.bold);
-            console.log(`👮 AGENT: Action aborted. Funds safe.`.white);
+  const badResponse = await callPremiumAPI(
+    "https://scam-site.com/download-ram"
+  );
+
+  if (badResponse.status === 402) {
+    console.log(
+      `🔒 AGENT: Paywall detected. Sending invoice to Aegis Firewall...`.blue
+    );
+
+    try {
+      const invoice = badResponse.paymentDetails;
+
+      const aegisResponse = await fetch(FIREWALL_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          agentAddress: AGENT_IDENTITY,
+          to: invoice.to,
+          amount: invoice.amount, // wei string
+          chainId: invoice.chainId,
+          token: invoice.token,
+        }),
+      });
+
+      const data = await aegisResponse.json();
+
+      if (!aegisResponse.ok) {
+        throw new Error(data.error || "Firewall HTTP error");
+      }
+
+      if (!data.approved) {
+        throw new Error(data.reason || "Payment not approved by Aegis");
+      }
+
+      // If somehow approved (shouldn't be if your policy is sane)
+      console.log(`✅ AEGIS: Payment Authorized`.green);
+
+      if (data.settlement && data.settlement.txHash) {
+        console.log(`🚀 Tx Hash: ${data.settlement.txHash}`.gray);
+        if (data.settlement.explorerUrl) {
+          console.log(
+            `🔗 Explorer: ${data.settlement.explorerUrl}`.gray
+          );
         }
+      }
+    } catch (error) {
+      console.log(`🛡️  AEGIS INTERVENTION:`.red);
+      console.log(`❌ BLOCK REASON: ${error.message}`.red.bold);
+      console.log(`👮 AGENT: Action aborted. Funds safe.`.white);
     }
+  }
 }
 
+// Node 18+ has built-in fetch
 runAgent();
