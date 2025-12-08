@@ -12,7 +12,6 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@thirdweb-dev/sdk": "^4.0.99",
     "axios": "^1.13.2",
     "body-parser": "^2.2.1",
     "colors": "^1.4.0",
@@ -20,6 +19,8 @@
     "dotenv": "^17.2.3",
     "ethers": "^5.8.0",
     "express": "^5.2.1",
-    "nodemon": "^3.1.11"
+    "nodemon": "^3.1.11",
+    "thirdweb": "^5.115.3",
+    "viem": "^2.41.2"
   }
 }
