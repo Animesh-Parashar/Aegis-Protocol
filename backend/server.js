@@ -156,6 +156,11 @@ function evaluatePolicy({ policy, requestedEth, localCurrentSpend }) {
 
 // --- ROUTES ---
 
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok' });
+});
+
+
 // Basic status/config for dashboard
 app.get("/api/config", async (req, res) => {
   try {
