@@ -83,7 +83,7 @@ graph LR
     A[🤖 AI Agent Script] -- 1. Payment Request --> B(🔥 Aegis Middleware Node)
     B -- 2. Read Policy --> C{📜 Smart Contract}
     C -- 3. Allow/Deny --> B
-    B -- 4. Sign & Broadcast --> D[🔗 Base Sepolia Chain]
+    B -- 4. Sign & Broadcast --> D[🔗 Avalanche Fuji]
     E[👨‍💻 User Dashboard] -- Manage Policies --> C
     E -- Monitor Logs --> B
 ```
@@ -122,7 +122,7 @@ Human operator view of all agent activity.
 ### **Prerequisites**
 
 * Node.js 18+
-* MetaMask Wallet (with Base Sepolia ETH)
+* MetaMask Wallet (with Avalanche Fuji AVAX)
 * Thirdweb API Key
 
 ---
