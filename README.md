@@ -26,11 +26,11 @@ Today, handing an AI agent a private key is like **giving a toddler a loaded gun
 
 Aegis introduces an **interception and policy-enforcement layer** between AI Agents and the blockchain.
 
-### ✔️ The Agent never touches the private key
+##### ✔️ The Agent never touches the private key
 
-### ✔️ Every transaction must pass an on-chain policy
+##### ✔️ Every transaction must pass an on-chain policy
 
-### ✔️ Aegis will *refuse to sign* any unsafe or unauthorized request
+##### ✔️ Aegis will *refuse to sign* any unsafe or unauthorized request
 
 ---
 
