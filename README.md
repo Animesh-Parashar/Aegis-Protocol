@@ -80,12 +80,13 @@ Generate synthetic malicious or benign agent behavior for demos & testing.
 
 ```mermaid
 graph LR
-    A[🤖 AI Agent Script] -- 1. Payment Request --> B(🔥 Aegis Middleware Node)
-    B -- 2. Read Policy --> C{📜 Smart Contract}
-    C -- 3. Allow/Deny --> B
-    B -- 4. Sign & Broadcast --> D[🔗 Avalanche Fuji]
-    E[👨‍💻 User Dashboard] -- Manage Policies --> C
-    E -- Monitor Logs --> B
+    A[🤖 AI Agent] -->|1. JSON-RPC Tx| B(🛡️ Aegis /rpc Firewall)
+    B -->|2. Read Policy| C{📜 AegisGuardV2}
+    C -->|3. Allow/Block| B
+    B -->|4. Forward Valid Tx| D[🔗 Avalanche RPC Node]
+    E[👨‍💻 Dashboard] -->|Manage Policies| C
+    E -->|Monitor Activity| B
+
 ```
 
 ### **Governance Layer (Smart Contract)**
@@ -129,7 +130,7 @@ Human operator view of all agent activity.
 
 # 1️⃣ Deploy the Smart Contract
 
-Deploy `AegisGuardV2.sol` via:
+Deploy `AegisV2.sol` via:
 
 * **Thirdweb Deploy**, or
 * **Hardhat**
@@ -198,6 +199,37 @@ Start the UI:
 ```bash
 npm run dev
 ```
+
+## 4️⃣ Using Aegis in Protocol Mode (RPC Firewall)
+
+Replace your existing RPC provider with:
+
+```ts
+const provider = new ethers.providers.JsonRpcProvider(
+  "https://<your-aegis-node>/rpc",
+  {
+    headers: {
+      "x-aegis-user": "<USER_WALLET>",
+      "x-aegis-agent": "<AGENT_WALLET_OR_ID>"
+    }
+  }
+);
+
+```
+
+Aegis will intercept and decide whether the transaction is:
+
+-   Allowed → forwarded
+    
+-   Blocked → JSON-RPC error returned
+    
+-   Logged → visible in your dashboard
+    
+
+No contract changes required.  
+No wallet rewrites.  
+No developer overhead.
+
 ---
 
 ## 🧭 Roadmap & Future Work
