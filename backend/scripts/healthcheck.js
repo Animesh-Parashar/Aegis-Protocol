@@ -1,9 +1,9 @@
 /**
- * scripts/healthcheck.js (corrected)
+ * scripts/healthcheck.js (patched)
  *
  * - Scans pending queues (non-blocking SCAN).
- * - For each pending key, queries getPolicy(user, agent).
- * - If no pending keys, falls back to querying (ADMIN_WALLET, serverAgent).
+ * - For each pending key, only performs LRANGE if the key is a Redis list (prevents WRONGTYPE).
+ * - Shows a small preview for string keys (processed markers).
  *
  * Usage:
  *   node scripts/healthcheck.js
@@ -105,6 +105,21 @@ async function scanKeys(redisClient, pattern = "pending:*", limit = 1000) {
       const sample = keys.slice(0, 10);
       for (const key of sample) {
         console.log("\n=> Pending Key:", key);
+
+        // only call LRANGE on Redis lists to avoid WRONGTYPE
+        const ktype = await redis.type(key);
+        if (ktype !== "list") {
+          console.log(`  Skipping key (not a list): ${key} (type=${ktype})`);
+          if (ktype === "string") {
+            try {
+              const val = await redis.get(key);
+              const preview = val && val.length > 200 ? val.slice(0, 200) + "..." : val;
+              console.log("    string preview:", preview);
+            } catch (_) { /* ignore preview errors */ }
+          }
+          continue;
+        }
+
         const items = await redis.lrange(key, 0, -1);
         console.log("  Items in queue:", items.length);
         for (let j = 0; j < Math.min(items.length, 5); j++) {
@@ -144,10 +159,12 @@ async function scanKeys(redisClient, pattern = "pending:*", limit = 1000) {
       }
     }
 
-    // Total pending items summary
+    // Total pending items summary (only count lists)
     let pendingTotal = 0;
     const allKeys = await scanKeys(redis, "pending:*", 1000);
     for (const k of allKeys) {
+      const t = await redis.type(k);
+      if (t !== "list") continue;
       const len = await redis.llen(k);
       pendingTotal += len;
     }
