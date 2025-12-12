@@ -19,6 +19,8 @@
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
+    "ioredis": "^5.8.2",
+    "node-cron": "^4.2.1",
     "nodemon": "^3.1.11",
     "thirdweb": "^5.115.3"
   }

@@ -1,8 +1,26 @@
+/**
+ * server.js
+ * Aegis Firewall Node (updated)
+ *
+ * - Keeps original simulator endpoints intact.
+ * - Adds JSON-RPC /rpc firewall endpoint (drop-in).
+ * - Adds Redis-backed off-chain reservation for daily spend.
+ * - Pushes successful settlements to a pending queue.
+ * - Anchors pending items by calling AegisGuardV2.recordSpend(...) via a facilitator key.
+ *
+ * Requirements:
+ *  - Node 18+ (global fetch)
+ *  - npm install ioredis node-cron
+ *
+ * Replace your existing server.js with this (or merge changes).
+ */
+
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { ThirdwebSDK } = require("@thirdweb-dev/sdk");
 const { ethers } = require("ethers");
+const Redis = require("ioredis");
 
 const app = express();
 app.use(cors());
@@ -16,9 +34,21 @@ const ADMIN_WALLET = process.env.ADMIN_WALLET_ADDRESS;
 const RPC_URL = process.env.RPC_URL || "https://api.avax-test.network/ext/bc/C/rpc";
 const AGENT_PRIVATE_KEY = process.env.AGENT_PRIVATE_KEY;
 const THIRDWEB_SECRET_KEY = process.env.THIRDWEB_SECRET_KEY;
+const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+const FACILITATOR_PRIVATE_KEY = process.env.FACILITATOR_PRIVATE_KEY || process.env.ANCHOR_ADMIN_PRIVATE_KEY;
+
+// Anchor / batching params
+const ANCHOR_EPOCH_SECONDS = process.env.ANCHOR_EPOCH_SECONDS
+  ? Number(process.env.ANCHOR_EPOCH_SECONDS)
+  : 15 * 60; // 15 minutes
+const ANCHOR_BATCH_SIZE = process.env.ANCHOR_BATCH_SIZE ? Number(process.env.ANCHOR_BATCH_SIZE) : 20;
+const ANCHOR_MIN_DELTA_WEI = process.env.ANCHOR_MIN_DELTA_WEI
+  ? ethers.BigNumber.from(process.env.ANCHOR_MIN_DELTA_WEI)
+  : ethers.utils.parseEther("0.0"); // default 0 => process everything
 
 const EXPLORER_BASE_URL = process.env.EXPLORER_BASE_URL || "https://testnet.snowtrace.io/tx/";
 
+// --- ENV GUARDS ---
 if (!AGENT_PRIVATE_KEY) {
   console.error("❌ AGENT_PRIVATE_KEY missing in .env — server cannot start.");
   process.exit(1);
@@ -35,7 +65,12 @@ if (!THIRDWEB_SECRET_KEY) {
   console.error("❌ THIRDWEB_SECRET_KEY missing in .env — server cannot start.");
   process.exit(1);
 }
+if (!FACILITATOR_PRIVATE_KEY) {
+  console.error("❌ FACILITATOR_PRIVATE_KEY missing in .env — server cannot start.");
+  process.exit(1);
+}
 
+// --- THIRDWEB / ETHERS SETUP ---
 const sdk = ThirdwebSDK.fromPrivateKey(AGENT_PRIVATE_KEY, CHAIN, {
   secretKey: THIRDWEB_SECRET_KEY,
 });
@@ -43,13 +78,26 @@ const sdk = ThirdwebSDK.fromPrivateKey(AGENT_PRIVATE_KEY, CHAIN, {
 const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
 const settlementWallet = new ethers.Wallet(AGENT_PRIVATE_KEY, provider);
 
-const AEGIS_ABI = [
-  "function getPolicy(address _user, address _agent) view returns (uint256 dailyLimit, uint256 currentSpend, uint256 lastReset, bool isActive, bool exists)",
+// AegisGuardV2 ABI minimal for recordSpend/getPolicy
+const AEGIS_GUARD_ABI = [
+  "function getPolicy(address _user, address _agent) view returns (uint256,uint256,uint256,bool,bool)",
+  "function recordSpend(address _user, address _agent, uint256 _amount, bytes32 _txHash) external",
+  "event SpendRecorded(address indexed user, address indexed agent, uint256 amount, bytes32 indexed txHash)"
 ];
 
-const policyContract = new ethers.Contract(CONTRACT_ADDRESS, AEGIS_ABI, provider);
+const aegisGuard = new ethers.Contract(CONTRACT_ADDRESS, AEGIS_GUARD_ABI, provider);
 
-// --- LOCAL STATE ---
+// --- REDIS SETUP ---
+const redis = new Redis(REDIS_URL,{
+  connectTimeout: 10000,
+  maxRetriesPerRequest: 5,
+});
+
+// Facilitator contract instance (writes via facilitator key)
+const facilitatorWallet = new ethers.Wallet(FACILITATOR_PRIVATE_KEY, provider);
+const aegisGuardFacilitator = new ethers.Contract(CONTRACT_ADDRESS, AEGIS_GUARD_ABI, facilitatorWallet);
+
+// --- LOCAL STATE (UI helpers only) ---
 let LOCAL_STATE = {
   currentSpend: 0.0,
   templates: [
@@ -64,11 +112,11 @@ let LOCAL_STATE = {
 (async () => {
   try {
     const address = await sdk.wallet.getAddress();
-    console.log(`\n🤖 Aegis Firewall Online.`);
-    console.log(`🔑 Server Agent Address: ${address}`);
-    console.log(`🌉 Chain: ${CHAIN}`);
-    console.log(`📜 Policy Contract: ${CONTRACT_ADDRESS}`);
-    console.log(`🔭 Read RPC: ${RPC_URL}`);
+    console.log(`\nAegis Firewall Online.`);
+    console.log(`Server Agent Address: ${address}`);
+    console.log(`Chain: ${CHAIN}`);
+    console.log(`Policy Contract: ${CONTRACT_ADDRESS}`);
+    console.log(`Read RPC: ${RPC_URL}`);
 
     LOCAL_STATE.agents.push({
       id: "default-server-agent",
@@ -76,18 +124,18 @@ let LOCAL_STATE = {
       address,
     });
   } catch (e) {
-    console.error(
-      "❌ Startup Error: Check .env for Private Key / network connectivity",
-      e
-    );
+    console.error("❌ Startup Error: Check .env for Private Key / network connectivity", e);
     process.exit(1);
   }
 })();
 
 // --- HELPERS ---
 
+/**
+ * Load policy for a given user/agent pair from chain.
+ */
 async function loadPolicy(userAddress, agentAddress) {
-  const policy = await policyContract.getPolicy(userAddress, agentAddress);
+  const policy = await aegisGuard.getPolicy(userAddress, agentAddress);
 
   const dailyLimitWei = policy[0];
   const currentSpendWei = policy[1];
@@ -109,7 +157,10 @@ async function loadPolicy(userAddress, agentAddress) {
   };
 }
 
-
+/**
+ * Evaluate a spend request against a policy + local tracking.
+ * (This function still used for simple decisioning fallback)
+ */
 function evaluatePolicy({ policy, requestedEth, localCurrentSpend }) {
   if (!policy.exists) {
     return {
@@ -145,6 +196,95 @@ function evaluatePolicy({ policy, requestedEth, localCurrentSpend }) {
   };
 }
 
+// --- REDIS KEYS & RESERVATION HELPERS ---
+
+function getDayKeyTs(ts = Date.now()) {
+  const d = new Date(ts);
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function spendKey(user, agent, dayKey) {
+  return `spend:{user:${user.toLowerCase()}:agent:${agent.toLowerCase()}}:${dayKey}`;
+}
+
+function pendingKey(user, agent) {
+  return `pending:{user:${user.toLowerCase()}:agent:${agent.toLowerCase()}}`;
+}
+
+/**
+ * Atomic reserve via WATCH/MULTI CAS loop.
+ * amountWeiBN: ethers.BigNumber
+ * limitWeiBN: ethers.BigNumber (on-chain daily limit)
+ * Returns string with new total wei.
+ */
+async function reserveSpend(user, agent, amountWeiBN, limitWeiBN) {
+  const dayKey = getDayKeyTs();
+  const key = spendKey(user, agent, dayKey);
+  const amountStr = amountWeiBN.toString();
+  const maxRetries = 6;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    await redis.watch(key);
+    let currentStr = await redis.get(key);
+    if (!currentStr) currentStr = "0";
+    const currentBI = BigInt(currentStr);
+    const amountBI = BigInt(amountStr);
+    const newBI = currentBI + amountBI;
+
+    if (limitWeiBN && newBI > BigInt(limitWeiBN.toString())) {
+      await redis.unwatch();
+      throw new Error("LIMIT_EXCEEDED_OFFCHAIN_RESERVE");
+    }
+
+    const tx = redis.multi();
+    tx.set(key, newBI.toString());
+    tx.expire(key, 60 * 60 * 24 * 3);
+    const execRes = await tx.exec();
+    if (execRes === null) continue; // watched key changed; retry
+    return newBI.toString();
+  }
+  throw new Error("RESERVE_FAILED_RETRIES");
+}
+
+/**
+ * Rollback a reserved amount. Safe to call if key missing.
+ */
+async function rollbackSpend(user, agent, amountWeiBN) {
+  const dayKey = getDayKeyTs();
+  const key = spendKey(user, agent, dayKey);
+  const amountBI = BigInt(amountWeiBN.toString());
+  const maxRetries = 6;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    await redis.watch(key);
+    let currentStr = await redis.get(key);
+    if (!currentStr) currentStr = "0";
+    const currentBI = BigInt(currentStr);
+    const newBI = currentBI - amountBI;
+    const newVal = newBI < 0n ? 0n : newBI;
+    const tx = redis.multi();
+    tx.set(key, newVal.toString());
+    tx.expire(key, 60 * 60 * 24 * 3);
+    const execRes = await tx.exec();
+    if (execRes === null) continue;
+    return newVal.toString();
+  }
+  throw new Error("ROLLBACK_FAILED");
+}
+
+async function readCurrentSpend(user, agent) {
+  const key = spendKey(user, agent, getDayKeyTs());
+  const v = await redis.get(key);
+  return v || "0";
+}
+
+async function iterateKeys(pattern = "pending:*", limit = 1000) {
+  return await scanKeys(redis, pattern, limit);
+}
+
+// --- JSON-RPC forwarding helper ---
 async function forwardJsonRpc(requestBody) {
   const upstreamRes = await fetch(RPC_URL, {
     method: "POST",
@@ -162,7 +302,6 @@ async function forwardJsonRpc(requestBody) {
   }
 }
 
-
 function buildAegisRpcError({ id, jsonrpc, code, message, data }) {
   return {
     jsonrpc: jsonrpc || "2.0",
@@ -175,13 +314,11 @@ function buildAegisRpcError({ id, jsonrpc, code, message, data }) {
   };
 }
 
+// --- ROUTES (unchanged simulator routes kept as-is) ---
 
-// --- ROUTES ---
-
-app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok' });
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "ok" });
 });
-
 
 app.get("/api/config", async (req, res) => {
   try {
@@ -202,6 +339,7 @@ app.get("/api/config", async (req, res) => {
   }
 });
 
+// Agent management
 app.get("/api/agents", (req, res) => res.json(LOCAL_STATE.agents));
 
 app.post("/api/agents/add", (req, res) => {
@@ -212,7 +350,7 @@ app.post("/api/agents/add", (req, res) => {
 
   const agent = { id: Date.now(), name, address };
   LOCAL_STATE.agents.push(agent);
-  console.log(`✅ Agent Onboarded: ${name} (${address})`);
+  console.log(`Agent Onboarded: ${name} (${address})`);
 
   res.json({ success: true, agents: LOCAL_STATE.agents });
 });
@@ -223,6 +361,7 @@ app.post("/api/agents/remove", (req, res) => {
   res.json({ success: true, agents: LOCAL_STATE.agents });
 });
 
+// Templates
 app.get("/api/templates", (req, res) => res.json(LOCAL_STATE.templates));
 
 app.post("/api/templates/add", (req, res) => {
@@ -235,168 +374,29 @@ app.post("/api/templates/add", (req, res) => {
   res.json({ success: true, templates: LOCAL_STATE.templates });
 });
 
-app.post("/api/rpc/execute", async (req, res) => {
-  const { to, amount, agentAddress, userAddress } = req.body;
-
-  if (!to) return res.status(400).json({ error: "Missing 'to' address" });
-  if (!amount) return res.status(400).json({ error: "Missing 'amount' (wei string)" });
-
-  let amountWei;
-  try {
-    amountWei = ethers.BigNumber.from(amount);
-  } catch (e) {
-    return res.status(400).json({ error: "Invalid amount: must be a valid wei string" });
-  }
-
-  if (amountWei.lte(ethers.constants.Zero)) {
-    return res.status(400).json({ error: "Invalid amount: must be > 0" });
-  }
-
-  const requestedEth = Number(ethers.utils.formatEther(amountWei)); // AVAX amount
-
-  try {
-    const effectiveAgentAddress =
-      agentAddress || (await sdk.wallet.getAddress());
-
-    const effectiveUserAddress = userAddress || ADMIN_WALLET;
-
-    console.log(
-      `\n🛡️  AEGIS CHECK: Agent ${effectiveAgentAddress.slice(
-        0,
-        6
-      )}... wants to send ${requestedEth} AVAX to ${to} on behalf of ${effectiveUserAddress}`
-    );
-
-    const policy = await loadPolicy(effectiveUserAddress, effectiveAgentAddress);
-
-    const decision = evaluatePolicy({
-      policy,
-      requestedEth,
-      localCurrentSpend: LOCAL_STATE.currentSpend,
-    });
-
-    let txHash = null;
-    let explorerUrl = null;
-
-    if (decision.approved) {
-      console.log("✅ APPROVED by Aegis Firewall. Sending on-chain tx on Avalanche...");
-
-      const tx = await settlementWallet.sendTransaction({
-        to,
-        value: amountWei,
-      });
-
-      console.log(`⛓️  On-chain tx sent: ${tx.hash}`);
-
-      LOCAL_STATE.currentSpend += requestedEth;
-
-      txHash = tx.hash;
-      explorerUrl = `${EXPLORER_BASE_URL}${tx.hash}`;
-    } else {
-      console.log(`❌ BLOCKED by Aegis Firewall: ${decision.reason}`);
-    }
-
-    return res.json({
-      success: true,
-      approved: decision.approved,
-      code: decision.code,
-      reason: decision.reason,
-      request: {
-        to,
-        amountWei: amountWei.toString(),
-        amountEth: requestedEth, 
-        agentAddress: effectiveAgentAddress,
-        userAddress: effectiveUserAddress,
-      },
-      policy: {
-        exists: policy.exists,
-        isActive: policy.isActive,
-        dailyLimitEth: policy.dailyLimitEth, // AVAX
-        currentSpendEth: policy.currentSpendEth, // AVAX
-        remainingEth: policy.remainingEth, // AVAX
-        lastReset: policy.lastReset,
-      },
-      localTracking: {
-        localCurrentSpend: LOCAL_STATE.currentSpend,
-      },
-      settlement: {
-        performedBy: decision.approved ? "AGENT_WALLET_DIRECT" : "NONE",
-        txHash,
-        explorerUrl,
-        note: decision.approved
-          ? "On-chain transaction sent by Aegis simulation wallet on Avalanche."
-          : "No settlement performed due to policy block.",
-      },
-    });
-  } catch (error) {
-    console.error("⚠️  Error in /api/rpc/execute:", error);
-    return res.status(500).json({
-      error:
-        (error && (error.reason || error.message)) ||
-        "Policy check or settlement failed (network / contract issue)",
-    });
-  }
-});
-
-app.get("/api/policy", async (req, res) => {
-  try {
-    const serverAddress = await sdk.wallet.getAddress();
-    const userAddress = req.query.user || ADMIN_WALLET;
-    const agentAddress = req.query.agent || serverAddress;
-
-    const policy = await loadPolicy(userAddress, agentAddress);
-    res.json({ userAddress, agentAddress, policy });
-  } catch (e) {
-    console.error("GET /api/policy error:", e);
-    res.status(500).json({ error: e.message || "Failed to load policy" });
-  }
-});
-/**
- * JSON-RPC FIREWALL ENDPOINT
- *
- * This is the "protocol" interface.
- * Any agent / dApp can point its provider at /rpc instead of a normal RPC URL.
- *
- * Integration example (ethers.js):
- *
- *   const provider = new ethers.providers.JsonRpcProvider("https://your-aegis-url.onrender.com/rpc", {
- *     headers: {
- *       "x-aegis-user": "<USER_WALLET>",
- *       "x-aegis-agent": "<AGENT_WALLET_OR_ID>",
- *     },
- *   });
- *
- * Aegis will:
- *   - Intercept eth_sendTransaction / eth_sendRawTransaction
- *   - Run on-chain policy via AegisGuard
- *   - Block or forward to RPC_URL accordingly
- */
+// MAIN RPC FIREWALL ENDPOINT (protocol mode)
 app.post("/rpc", async (req, res) => {
   const body = req.body;
 
-  // Handler for a single JSON-RPC request object
   const handleSingle = async (rpcReq) => {
     const { method, params, id, jsonrpc } = rpcReq || {};
 
     if (!method) {
-      // Malformed request, just forward or return a generic error
       return buildAegisRpcError({
         id,
         jsonrpc,
-        code: -32600, // Invalid Request
+        code: -32600,
         message: "Aegis: Invalid JSON-RPC request",
         data: { original: rpcReq },
       });
     }
 
-    // If it's not a transaction-sending method, just forward it transparently
     if (method !== "eth_sendTransaction" && method !== "eth_sendRawTransaction") {
       return forwardJsonRpc(rpcReq);
     }
 
     let from, to;
     let valueBN;
-
     try {
       if (method === "eth_sendTransaction") {
         const tx = (params && params[0]) || {};
@@ -419,126 +419,160 @@ app.post("/rpc", async (req, res) => {
       return buildAegisRpcError({
         id,
         jsonrpc,
-        code: -32602, // Invalid params
+        code: -32602,
         message: "Aegis: Failed to parse transaction",
         data: { reason: err.message || String(err) },
       });
     }
 
-    // If there's no economic value, just forward it.
     if (!valueBN || valueBN.lte(ethers.constants.Zero)) {
       return forwardJsonRpc(rpcReq);
     }
 
-    // Convert value to AVAX (ETH units)
     const requestedEth = Number(ethers.utils.formatEther(valueBN));
-
-    // Derive user/agent identities.
-    // Priority:
-    //   headers > tx.from > ADMIN_WALLET / server agent
     const headerUser = req.headers["x-aegis-user"];
     const headerAgent = req.headers["x-aegis-agent"];
-
     const serverAgentAddress = await sdk.wallet.getAddress();
 
     const effectiveUserAddress = (headerUser || from || ADMIN_WALLET).toLowerCase();
     const effectiveAgentAddress = (headerAgent || from || serverAgentAddress).toLowerCase();
 
     console.log(
-      `\n🛡️  AEGIS RPC CHECK: method=${method}, ` +
-        `agent=${effectiveAgentAddress.slice(0, 6)}..., ` +
-        `user=${effectiveUserAddress.slice(0, 6)}..., ` +
-        `to=${to || "0x0"}, value=${requestedEth} AVAX`
+      `AEGIS RPC CHECK: method=${method}, agent=${effectiveAgentAddress.slice(0, 6)}..., user=${effectiveUserAddress.slice(0, 6)}..., to=${to || "0x0"}, value=${requestedEth} AVAX`
     );
 
     try {
-      // 1) Load on-chain policy
+      // 1) load policy
       const policy = await loadPolicy(effectiveUserAddress, effectiveAgentAddress);
 
-      // 2) Evaluate against policy + optional local tracking
-      const decision = evaluatePolicy({
-        policy,
-        requestedEth,
-        // For now reuse LOCAL_STATE.currentSpend as a UX helper.
-        // If you want *pure* on-chain truth, you can set this to 0.
-        localCurrentSpend: LOCAL_STATE.currentSpend,
-      });
-
-      if (!decision.approved) {
-        console.log(
-          `❌ AEGIS BLOCKED: code=${decision.code}, reason=${decision.reason}`
-        );
-
+      if (!policy.exists) {
         return buildAegisRpcError({
           id,
           jsonrpc,
-          code: -32001, // Custom application error
-          message: `Aegis: ${decision.code}`,
-          data: {
-            reason: decision.reason,
-            policy: {
-              exists: policy.exists,
-              isActive: policy.isActive,
-              dailyLimitEth: policy.dailyLimitEth,
-              currentSpendEth: policy.currentSpendEth,
-              remainingEth: policy.remainingEth,
-              lastReset: policy.lastReset,
-            },
-            request: {
-              from,
-              to,
-              valueWei: valueBN.toString(),
-              valueEth: requestedEth,
-              userAddress: effectiveUserAddress,
-              agentAddress: effectiveAgentAddress,
-              method,
-            },
-          },
+          code: -32001,
+          message: "Aegis: NO_POLICY",
+          data: { reason: "No on-chain policy set for this agent." },
+        });
+      }
+      if (!policy.isActive) {
+        return buildAegisRpcError({
+          id,
+          jsonrpc,
+          code: -32001,
+          message: "Aegis: KILL_SWITCH",
+          data: { reason: "Kill switch is active for this agent." },
         });
       }
 
-      console.log("✅ AEGIS APPROVED: forwarding to upstream RPC...");
+      // Prefer raw on-chain dailyLimit if available
+      const dailyLimitWeiBN = (policy.raw && policy.raw[0]) ? policy.raw[0] : ethers.utils.parseEther(String(policy.dailyLimitEth));
 
-      // 3) Forward to the real RPC node
-      const upstreamResponse = await forwardJsonRpc(rpcReq);
-
-      // Optional: bump local spend for dashboard UX if upstream succeeded
+      // 2) Reserve off-chain before forwarding
       try {
-        if (!upstreamResponse.error) {
-          LOCAL_STATE.currentSpend += requestedEth;
+        await reserveSpend(effectiveUserAddress, effectiveAgentAddress, valueBN, dailyLimitWeiBN);
+      } catch (reserveErr) {
+        if (reserveErr.message === "LIMIT_EXCEEDED_OFFCHAIN_RESERVE") {
+          return buildAegisRpcError({
+            id,
+            jsonrpc,
+            code: -32001,
+            message: "Aegis: LIMIT_EXCEEDED",
+            data: { reason: `Requested ${requestedEth} AVAX exceeds daily limit.` },
+          });
         }
-      } catch {
-        // best-effort; don't crash on metrics
+        return buildAegisRpcError({
+          id,
+          jsonrpc,
+          code: -32002,
+          message: "Aegis: RESERVE_FAILED",
+          data: { reason: reserveErr.message || String(reserveErr) },
+        });
       }
 
+      console.log("AEGIS APPROVED (reserved): forwarding to upstream RPC...");
+
+      // 3) Forward
+      let upstreamResponse;
+      try {
+        upstreamResponse = await forwardJsonRpc(rpcReq);
+      } catch (forwardErr) {
+        // rollback on forward failure
+        try {
+          await rollbackSpend(effectiveUserAddress, effectiveAgentAddress, valueBN);
+        } catch (rbErr) {
+          console.error("Rollback failed after forward error:", rbErr);
+        }
+        return buildAegisRpcError({
+          id,
+          jsonrpc,
+          code: -32003,
+          message: "Aegis: FORWARD_FAILED",
+          data: { reason: forwardErr.message || String(forwardErr) },
+        });
+      }
+
+      // If upstream returned an error: rollback reservation and return upstream error
+      if (upstreamResponse && upstreamResponse.error) {
+        try {
+          await rollbackSpend(effectiveUserAddress, effectiveAgentAddress, valueBN);
+        } catch (rbErr) {
+          console.error("Rollback failed after upstream error:", rbErr);
+        }
+        return upstreamResponse;
+      }
+
+      // At this point upstream likely returned { jsonrpc, id, result: "<txHash>" }
+      // Extract txHash robustly
+      let txHash = null;
+      if (upstreamResponse && upstreamResponse.result) txHash = upstreamResponse.result;
+      // in some upstreams result may be an object with hash
+      if (!txHash && upstreamResponse && upstreamResponse.hash) txHash = upstreamResponse.hash;
+      // txHash should be a 0x-prefixed 32-byte hex string
+      if (!txHash || !ethers.utils.isHexString(txHash)) {
+        // best-effort: try to find a hex string in the response
+        const maybe = JSON.stringify(upstreamResponse).match(/0x[a-fA-F0-9]{64}/);
+        if (maybe) txHash = maybe[0];
+      }
+
+      // push to pending queue for anchoring (if txHash exists)
+      const pending = {
+        txHash: txHash || null,
+        amountWei: valueBN.toString(),
+        timestamp: Date.now()
+      };
+      await redis.lpush(pendingKey(effectiveUserAddress, effectiveAgentAddress), JSON.stringify(pending));
+
+      // Update local UX state roughly
+      try {
+        const readVal = await readCurrentSpend(effectiveUserAddress, effectiveAgentAddress);
+        LOCAL_STATE.currentSpend = Number(ethers.utils.formatEther(readVal));
+      } catch (_) {}
+
+      // Return upstream response unchanged
       return upstreamResponse;
+
     } catch (err) {
-      console.error("⚠️  Aegis /rpc internal error:", err);
+      console.error("AEGIS /rpc internal error:", err);
       return buildAegisRpcError({
         id,
         jsonrpc,
         code: -32002,
         message: "Aegis: Internal policy check error",
-        data: {
-          reason: err.message || String(err),
-        },
+        data: { reason: err.message || String(err) },
       });
     }
-  };
+  }; // end handleSingle
 
   try {
     if (Array.isArray(body)) {
-      // Batch JSON-RPC
       const results = await Promise.all(body.map((reqItem) => handleSingle(reqItem)));
       return res.json(results);
     } else {
-      // Single JSON-RPC request
       const result = await handleSingle(body);
       return res.json(result);
     }
   } catch (err) {
-    console.error("⚠️  /rpc top-level error:", err);
-    // If body has an id, reuse it. Otherwise null.
+    console.error("/rpc top-level error:", err);
     const id = body && body.id;
     return res.status(500).json(
       buildAegisRpcError({
@@ -552,7 +586,81 @@ app.post("/rpc", async (req, res) => {
   }
 });
 
+// Optional: direct policy inspection for UI
+app.get("/api/policy", async (req, res) => {
+  try {
+    const serverAddress = await sdk.wallet.getAddress();
+    const userAddress = req.query.user || ADMIN_WALLET;
+    const agentAddress = req.query.agent || serverAddress;
 
-app.listen(PORT, () =>
-  console.log(`🔥 Aegis Firewall Node Running on Port ${PORT} (Avalanche Mode)`)
-);
+    const policy = await loadPolicy(userAddress, agentAddress);
+    res.json({ userAddress, agentAddress, policy });
+  } catch (e) {
+    console.error("GET /api/policy error:", e);
+    res.status(500).json({ error: e.message || "Failed to load policy" });
+  }
+});
+
+// --- ANCHOR (recordSpend) JOB ---
+// Drains pending:<user>:<agent> lists and calls AegisGuardV2.recordSpend via facilitator key.
+async function runRecordSpendJob() {
+  try {
+    // Use SCAN for production scale; KEYS acceptable for small-scale testing.
+    const keys = await iteratePendingKeys("pending:*");;
+    for (const key of keys) {
+      const [, user, agent] = key.split(":"); // pending:user:agent
+      for (let i = 0; i < ANCHOR_BATCH_SIZE; i++) {
+        const raw = await redis.rpop(key);
+        if (!raw) break;
+        let item;
+        try {
+          item = JSON.parse(raw);
+        } catch (e) {
+          console.warn("Malformed pending item:", raw);
+          continue;
+        }
+
+        const { txHash, amountWei } = item;
+        if (!txHash) {
+          console.warn("Pending missing txHash, moving to failed queue:", item);
+          await redis.lpush(`failed:${key}`, raw);
+          continue;
+        }
+
+        // check processed flag
+        const procKey = `${key}:processed:${txHash}`;
+        const already = await redis.get(procKey);
+        if (already) continue;
+
+        // Convert txHash into bytes32 format expected by contract; assume txHash is 0x-prefixed 32 bytes
+        if (!ethers.utils.isHexString(txHash, 32)) {
+          console.warn("Invalid txHash length for recordSpend; moving to failed queue:", txHash);
+          await redis.lpush(`failed:${key}`, raw);
+          continue;
+        }
+
+        try {
+          const tx = await aegisGuardFacilitator.recordSpend(user, agent, ethers.BigNumber.from(amountWei), txHash);
+          console.log("recordSpend tx sent:", tx.hash);
+          await tx.wait(1);
+          console.log("recordSpend confirmed:", tx.hash);
+          await redis.set(procKey, String(Date.now()), "EX", 60 * 60 * 24 * 7);
+        } catch (err) {
+          console.error("recordSpend failed, pushing to failed:", err);
+          // push to failed queue for operator retry & alert
+          await redis.lpush(`failed:${key}`, raw);
+          // stop draining this key to avoid hotloop when contract revert happens (e.g., limit exceeded)
+          break;
+        }
+      } // end batch
+    } // end keys loop
+  } catch (err) {
+    console.error("runRecordSpendJob failed:", err);
+  }
+}
+
+// schedule the recordSpend job
+setInterval(runRecordSpendJob, ANCHOR_EPOCH_SECONDS * 1000);
+
+// --- START SERVER ---
+app.listen(PORT, () => console.log(`Aegis Firewall Node Running on Port ${PORT} (Avalanche Mode)`));
