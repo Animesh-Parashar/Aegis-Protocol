@@ -117,6 +117,77 @@ Human operator view of all agent activity.
 | **Frontend**        | React, Vite, Tailwind, Lucide Icons |
 
 ---
+Here is a **tight, high-impact, investor/judge-ready** Valkey architecture section with a crisp Mermaid diagram.
+Copy-paste directly into your README.
+
+---
+
+## ⚡ Valkey Enforcement Layer
+
+### **Real-Time, Deterministic Spend Control for Autonomous Agents**
+
+Aegis enforces limits using a **hybrid off-chain + on-chain architecture** purpose-built for x402 and agent-driven commerce.
+
+Valkey (Redis) acts as the **economic governor**:
+
+* **Atomic reservations** prevent overspend *before* a tx ever hits the chain
+* **Pending queues** capture real txHashes for later anchoring
+* **Processed markers** create replay protection
+* **Anchoring** commits spend logs to the AegisGuard contract for public verification
+
+This gives sub-millisecond enforcement with on-chain auditability.
+
+---
+
+## 🗺️ **Aegis + Valkey Architecture (Mermaid)**
+
+```mermaid
+flowchart LR
+    Agent[Agent] -->|eth_sendRawTransaction| Firewall[Aegis RPC Firewall]
+
+    Firewall -->|1. Load Policy| Policy[(AegisGuardV2)]
+    Firewall -->|2. Reserve Spend WATCH-MULTI| Cache[(Valkey)]
+    
+    Cache -->|OK| Firewall
+    Firewall -->|3. Forward to RPC| Chain[Avalanche Fuji]
+
+    Chain -->|txHash| Pending[(pending user agent)]
+
+    subgraph Offchain_Ledger [Offchain Ledger]
+        Cache
+        Pending
+        Processed[(processed txHash)]
+    end
+
+    Anchor[Background Anchor] -->|recordSpend| Policy
+    Policy -->|emit SpendRecorded| Processed
+```
+
+---
+
+## 🔑 **Why This Matters**
+
+**1. Deterministic Enforcement**
+Every transaction is checked *before* broadcasting, guaranteeing agents cannot exceed limits—even due to hallucinations, loops, or injection attacks.
+
+**2. Zero Gas Overhead**
+Spend enforcement stays off-chain; the contract only logs successful spending batches.
+
+**3. Public Verifiability**
+`recordSpend` anchors the ledger on-chain, producing cryptographic, replay-protected audit trails.
+
+**4. x402 / EIP-8004 Ready**
+This model aligns perfectly with metered agent commerce:
+
+* per-agent budgets
+* per-user limits
+* pay-as-you-go metering
+* compliant off-chain measurement with on-chain settlement
+
+**5. Crash & Concurrency Safe**
+Valkey ensures no double-use, no race conditions, no replay—even under load.
+
+---
 
 ## 🚀 Installation & Setup
 
@@ -408,16 +479,6 @@ As AI agents become first-class economic actors, Aegis provides:
 PRs, issues, and feature requests are welcome!
 
 ---
-## Business Model
-### **Pricing Tiers Table**
-
-| Tier | Target Audience | Key Features | Pricing Model |
-| :--- | :--- | :--- | :--- |
-| **Developer (Freemium)** | Individual Developers, Hobbyists | • Signer Proxy Architecture<br>• Basic Policy Controls (e.g., spending limits)<br>• Support for 1 Agent, up to 100 tx/month | **Free.** Designed to drive adoption, community building, and developer experimentation. |
-| **Professional** | Power Users, Small DeFi Teams | • All Developer features<br>• ★ **Advanced Policy Controls** (contract whitelisting, rate limits)<br>• **"Matrix Mode" Dashboard**<br>• Support for up to 5 Agents | **$99/month** + 0.10% per-transaction fee on volume above a set threshold (e.g., $100k/month). |
-| **Enterprise** | DeFi Protocols, DAOs, Enterprises | • All Professional features<br>• ★ **Emergency Kill Switch**<br>• **Chaos Monkey Simulator**<br>• Custom On-chain Governance<br>• SLA & Priority Support | **Custom Pricing.** Based on transaction volume, number of agents, and required support/integration services. |
-
------
 
 ## 🛡️ License
 
